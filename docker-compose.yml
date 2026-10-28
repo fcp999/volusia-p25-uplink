@@ -1,0 +1,48 @@
+services:
+  detector:
+    build: .
+    image: volusia-p25-uplink:latest
+    container_name: volusia-uplink
+    restart: unless-stopped
+
+    # The HackRF is a raw USB device. Pass the whole bus through so the
+    # device can disappear and reappear without recreating the container.
+    # Requires the host to actually have /dev/bus/usb (Linux only).
+    #
+    # NOTE: in a Linux VM, USB *device* passthrough from VMware/Proxmox
+    # presents the device on the guest's /dev/bus/usb, so this works there.
+    # It does NOT work on Windows or macOS Docker Desktop.
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+
+    # hackrf tools want the device node RW; nothing else is privileged.
+    # Do NOT add privileged: true - it is not needed for hackrf.
+    security_opt:
+      - no-new-privileges:true
+
+    environment:
+      MODE: ${MODE:-sweep}
+      HACKRF_SERIAL: ${HACKRF_SERIAL:-0000000000000000406464c82346594b}
+      LNA: ${LNA:-32}
+      VGA: ${VGA:-22}
+      AMP: ${AMP:-0}
+      BIN_HZ: ${BIN_HZ:-2000}
+      PEAK_HEIGHT_DB: ${PEAK_HEIGHT_DB:-4.0}
+      DWELL: ${DWELL:-2}
+      ROUNDS: ${ROUNDS:-5}
+      CSV: ${CSV:-}
+      TZ: ${TZ:-America/New_York}
+
+    volumes:
+      - ./logs:/app/logs
+
+    # Detector exits on its own in calib/channel mode; the wrapper decides
+    # whether that is a completion or a fault. Keep logs readable.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # HackRF resets can take a few seconds; give it room before SIGKILL.
+    stop_grace_period: 15s

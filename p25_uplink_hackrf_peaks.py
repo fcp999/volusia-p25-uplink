@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""
+Volusia County FL - P25 Uplink Transmitter Finder (HackRF One, peak detection)
+
+WHY THIS VERSION
+  The previous hackrf_sweep detector compared every bin to one global noise
+  floor. On an 800 MHz band that has strong public-safety downlinks at
+  854-861 MHz, HackRF front-end overload raises the floor by 5-10 dB, so:
+      threshold too low  -> hundreds of false positives
+      threshold too high -> real 12.5 kHz P25 uplinks (+2..6 dB) never fire
+  A P25 uplink is NARROWBAND (~12.5 kHz wide, often a few ms per talk-spurt).
+  Downlink bleed is BROADBAND and smooth. So we detect LOCAL PEAKS, not
+  absolute level: a bin must stick out above its own neighbours.
+
+TWO MODES
+  1. sweep   (default) - hackrf_sweep over the whole 809-816 MHz uplink band.
+                         Fast, finds which CHANNELS carry traffic.
+                         Cannot resolve < ~25 kHz detail or burst timing.
+
+  2. channel (slow)    - retunes to each channel and does a narrow FFT.
+                         Slower but measures real SNR per channel and
+                         distinguishes "channel has a transmitter" from
+                         "band is noisy". Use once sweep has narrowed it down.
+
+WHAT THIS CAN AND CANNOT TELL YOU
+  * It detects RF energy on Volusia P25 uplink channels = a radio
+    transmitting near you. That is what "detect local transmitters" means.
+  * It does NOT demodulate P25 and cannot tell you the talkgroup, unit ID,
+    or which agency.
+  * Uplinks are frequency-hopping-optional, short (~100-300 ms voice spurs,
+    longer for data/registration). Sweep dwell is short, so you will see
+    activity but may miss some bursts. Channel mode has much better duty
+    cycle capture.
+  * RSSI is a relative indicator only. No calibration = no distance.
+
+USAGE
+  python3 p25_uplink_hackrf_peaks.py sweep
+  python3 p25_uplink_hackrf_peaks.py sweep --seconds 300 --csv sweep.csv
+  python3 p25_uplink_hackrf_peaks.py channel --dwell 2 --rounds 20
+  python3 p25_uplink_hackrf_peaks.py calib
+
+Requires: hackrf tools installed (hackrf_sweep, hackrf_transfer), python3,
+numpy (only for channel mode). Root/sudo for USB access.
+
+Author: built for Fred's Kali box, HackRF serial ...406464c82346594b
+"""
+
+import argparse
+import csv
+import os
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+from collections import defaultdict
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+# ---------------------------------------------------------------------------
+# Volusia County P25 uplink plan  (uplink = downlink - 45 MHz)
+# Source: RadioReference / prior lab notes. Site labels are approximate;
+# East/West Simulcast + Holly Hill. Verify against current RR data before
+# drawing conclusions about a specific site.
+# ---------------------------------------------------------------------------
+UPLINK_CHANNELS = {
+    809.3625: ("East", "860.7375"),
+    810.2125: ("West", "855.7375"),
+    810.4625: ("East", "855.4625"),
+    810.7375: ("West", "855.9875"),
+    811.2625: ("East", "856.2625"),
+    811.4875: ("East", "856.4875"),
+    811.7125: ("HH/EW", "856.7125"),
+    811.9375: ("East", "856.9375"),
+    811.9875: ("East", "856.9875"),
+    812.2125: ("HH",   "857.2125"),
+    812.2625: ("West", "857.2625"),
+    812.4875: ("East", "857.4875"),
+    812.7375: ("East", "857.4875"),
+    812.7625: ("East", "857.7625"),
+    813.2125: ("HH",   "858.2125"),
+    813.2625: ("East", "858.2625"),
+    813.4875: ("East", "858.4875"),
+    813.7125: ("EW",   "858.7125"),
+    813.7375: ("East", "858.7375"),
+    813.7625: ("West", "858.7625"),
+    814.2125: ("HH",   "859.2125"),
+    814.2625: ("East", "859.2625"),
+    814.4875: ("West", "859.4875"),
+    814.7125: ("East", "859.7125"),
+    814.7375: ("EW",   "859.7375"),
+    814.7625: ("East", "859.7625"),
+    815.2125: ("HH",   "860.2125"),
+    815.2625: ("West", "860.2625"),
+    815.4875: ("East", "860.4875"),
+    815.7125: ("West", "860.7125"),
+    815.7375: ("East", "860.7375"),
+    815.7625: ("West", "860.7625"),
+}
+
+# Sanity: dedupe (812.7375 had a bad downlink mapping in the old list)
+CHANNELS_HZ = sorted(int(round(f * 1e6)) for f in UPLINK_CHANNELS)
+
+FREQ_LOW_MHZ = 809
+FREQ_HIGH_MHZ = 816
+
+# --- HackRF settings -------------------------------------------------------
+SERIAL = os.environ.get("HACKRF_SERIAL", "0000000000000000406464c82346594b")
+AMP = 0       # 800 MHz + nearby strong downlinks: leave the amp OFF
+LNA = 32      # 0-40 dB, 8 dB steps
+VGA = 22      # 0-62 dB, 2 dB steps
+BIN_HZ = 2000 # ~2 kHz sweep resolution. Smaller = more bins = slower USB
+
+# --- Peak detection tuning -------------------------------------------------
+PEAK_RADIUS = 5      # compare each bin to +/- this many bins (5*2k = +/-10 kHz)
+PEAK_HEIGHT_DB = 4.0 # how far above local median to count as a real peak
+MIN_RUN_BINS = 2     # a peak must be >= 2 bins wide (rejects 1-bin spurs)
+CHANNEL_TOL_HZ = 8000    # a peak this close to a known channel = ON that channel
+COOLDOWN_SEC = 2.0   # do not re-print the same channel faster than this
+CHANNEL_EDGE_HZ = 10000  # ignore peaks right at the edges of a sweep segment
+
+
+def need(root_msg="hackrf tools"):
+    if shutil.which("hackrf_sweep") is None:
+        sys.exit(f"ERROR: hackrf_sweep not found. Install {root_msg}.")
+
+
+def sudo_prefix():
+    return [] if os.geteuid() == 0 else ["sudo"]
+
+
+def parse_sweep_line(line):
+    """hackrf_sweep CSV -> (hz_low, bin_width, [db...]) or None."""
+    p = line.strip().split(",")
+    if len(p) < 8:
+        return None
+    try:
+        hz_low = int(p[2])
+        bin_w = float(p[4])
+        dbs = [float(x) for x in p[6:]]
+    except (ValueError, IndexError):
+        return None
+    return hz_low, bin_w, dbs
+
+
+def sweep_cmd(one_pass=True):
+    cmd = sudo_prefix() + [
+        "hackrf_sweep",
+        "-d", SERIAL,
+        "-a", str(AMP),
+        "-l", str(LNA),
+        "-g", str(VGA),
+        "-w", str(BIN_HZ),
+        "-f", f"{FREQ_LOW_MHZ}:{FREQ_HIGH_MHZ}",
+    ]
+    if one_pass:
+        cmd.append("-1")
+    return cmd
+
+
+def collect_sweep(one_pass=True):
+    """Run sweep, return dict{bin_center_hz: dbm} merged at max per bin."""
+    proc = subprocess.Popen(sweep_cmd(one_pass), stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    merged = {}
+    try:
+        for line in proc.stdout:
+            parsed = parse_sweep_line(line)
+            if not parsed:
+                continue
+            hz_low, bin_w, dbs = parsed
+            for i, db in enumerate(dbs):
+                f = int(hz_low + i * bin_w)
+                if f not in merged or db > merged[f]:
+                    merged[f] = db
+    finally:
+        if one_pass:
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+        else:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    return merged
+
+
+def find_peaks(bins):
+    """
+    Local-peak detection on an ordered (freq, db) list.
+    Returns [(freq, db, prominence), ...] where prominence = db above the
+    median of its neighbourhood.
+    """
+    freqs = [f for f, _ in bins]
+    level = [d for _, d in bins]
+    n = len(level)
+    if n < 2 * PEAK_RADIUS + 1:
+        return []
+    out = []
+    for i in range(PEAK_RADIUS, n - PEAK_RADIUS):
+        window = level[i - PEAK_RADIUS:i + PEAK_RADIUS + 1]
+        local_med = statistics.median(window)
+        promo = level[i] - local_med
+        if promo < PEAK_HEIGHT_DB:
+            continue
+        if level[i] != max(window):
+            continue
+        # width check: neighbours at half-prominence
+        half = local_med + promo / 2.0
+        width = 1
+        j = i - 1
+        while j >= 0 and level[j] >= half:
+            width += 1
+            j -= 1
+        j = i + 1
+        while j < n and level[j] >= half:
+            width += 1
+            j += 1
+        if width < MIN_RUN_BINS:
+            continue
+        out.append((freqs[i], level[i], promo, width))
+    return out
+
+
+def nearest_channel(freq_hz):
+    best = min(CHANNELS_HZ, key=lambda c: abs(c - freq_hz))
+    return best, freq_hz - best
+
+
+def channel_label(ch_hz):
+    key = ch_hz / 1e6
+    info = UPLINK_CHANNELS.get(round(key, 4))
+    if info:
+        return info
+    # fall back to closest entry (float rounding safety)
+    k = min(UPLINK_CHANNELS, key=lambda x: abs(x - key))
+    return UPLINK_CHANNELS[k]
+
+
+def cmd_calib():
+    """
+    Measure the actual floor and the strongest thing in band, so you can
+    sanity-check gain. Two sweeps: amp off and amp on.
+    """
+    need()
+    print("=" * 74)
+    print("  HackRF receive calibration - Volusia P25 uplink band (809-816 MHz)")
+    print("=" * 74)
+    for amp in (0, 1):
+        global AMP
+        AMP = amp
+        t0 = time.time()
+        bins = collect_sweep()
+        if not bins:
+            print(f"  amp={amp}: no data (HackRF busy or unplugged?)")
+            continue
+        vals = list(bins.values())
+        vmin, vmed, vmax = min(vals), statistics.median(vals), max(vals)
+        fmax = max(bins, key=bins.get)
+        print(f"\n  amp={amp}  ({time.time()-t0:.1f}s, {len(bins)} bins)")
+        print(f"    floor   : {vmin:7.1f} dB")
+        print(f"    median  : {vmed:7.1f} dB   <- global noise floor reference")
+        print(f"    peak    : {vmax:7.1f} dB @ {fmax/1e6:.4f} MHz")
+        # how many bins are in hard overload (flat-topped) territory
+        hot = sum(1 for v in vals if v > vmed + 25)
+        print(f"    bins > floor+25 dB: {hot}")
+        if amp == 1 and hot > len(vals) * 0.02:
+            print("    !! amp=1 looks like overload; keep AMP=0")
+    print("\nIf median is above about -10 dB the front end is being driven hard;")
+    print("drop VGA by 8 and re-run. Peak-to-median of 25+ dB on a downlink is")
+    print("normal and means bleed, not an uplink.")
+
+
+def cmd_sweep(seconds, csv_path, verbose):
+    need()
+    print("=" * 74)
+    print("  Volusia P25 Uplink Finder - SWEEP mode (peak detection)")
+    print(f"  Band {FREQ_LOW_MHZ}-{FREQ_HIGH_MHZ} MHz | bin {BIN_HZ} Hz | "
+          f"LNA {LNA} VGA {VGA} AMP {AMP}")
+    print(f"  Peak rule: >= {PEAK_HEIGHT_DB} dB above local median, "
+          f"width >= {MIN_RUN_BINS} bins, within {CHANNEL_TOL_HZ//1000} kHz of a channel")
+    print(f"  Duration: {'until Ctrl-C' if seconds <= 0 else str(seconds) + 's'}")
+    print("=" * 74)
+
+    writer = None
+    if csv_path:
+        fh = open(csv_path, "w", newline="")
+        writer = csv.writer(fh)
+        writer.writerow(["utc", "ul_mhz", "dl_mhz", "site", "db",
+                         "prominence_db", "width_bins", "off_hz"])
+
+    # Track per-channel activity
+    hits = defaultdict(list)      # ch_hz -> [(ts, db, promo)]
+    last_print = {}
+    sweeps = 0
+    t_start = time.time()
+
+    print(f"\n{'time':<9} {'UL MHz':<11} {'DL MHz':<11} {'site':<6} "
+          f"{'dB':>7} {'prom':>6} {'w':>3} {'offset':>9}  ")
+    print("-" * 74)
+
+    try:
+        while True:
+            if seconds > 0 and time.time() - t_start >= seconds:
+                break
+            bins = collect_sweep()
+            if not bins:
+                print("  (no sweep data - HackRF busy or unplugged)")
+                time.sleep(1)
+                continue
+            sweeps += 1
+            now = datetime.now()
+            lo, hi = FREQ_LOW_MHZ * 1e6, FREQ_HIGH_MHZ * 1e6
+
+            ordered = sorted((f, d) for f, d in bins.items() if lo <= f <= hi)
+            peaks = find_peaks(ordered)
+
+            found_this_pass = set()
+            for peak in peaks:
+                f, db, promo, width = peak
+                ch, off = nearest_channel(f)
+                if abs(off) > CHANNEL_TOL_HZ:
+                    continue  # energy, but not on a known uplink channel
+                found_this_pass.add(ch)
+                last = last_print.get(ch, 0.0)
+                is_new = ch not in hits
+                hits[ch].append((now, db, promo))
+                if is_new or (now.timestamp() - last) >= COOLDOWN_SEC:
+                    last_print[ch] = now.timestamp()
+                    dl, site = channel_label(ch)
+                    print(f"{now.strftime('%H:%M:%S'):<9} "
+                          f"{f/1e6:<11.4f} {dl:<11} {site:<6} "
+                          f"{db:>7.1f} {promo:>6.1f} {width:>3} "
+                          f"{off/1000:>+7.1f}k  {'NEW' if is_new else ''}")
+                    if writer:
+                        writer.writerow([now.isoformat(), f"{f/1e6:.4f}", dl,
+                                         site, f"{db:.1f}", f"{promo:.1f}",
+                                         width, off])
+            if verbose and sweeps % 10 == 0:
+                print(f"  ..{sweeps} sweeps, channels with traffic so far: {len(hits)}")
+    except KeyboardInterrupt:
+        print("\n  stopped by user")
+    finally:
+        if csv_path:
+            fh.close()
+
+    dt = time.time() - t_start
+    print("\n" + "=" * 74)
+    print(f"  SUMMARY - {sweeps} sweeps over {dt:.0f}s")
+    print("=" * 74)
+    if not hits:
+        print("  No activity on known uplink channels.")
+        print("  Check: antenna connected, amp/gain not overloaded (run 'calib'),")
+        print("         and that you are actually inside Volusia County coverage.")
+    else:
+        print(f"  {'UL MHz':<10} {'DL MHz':<10} {'site':<6} "
+              f"{'hits':>5} {'peak dB':>8} {'best prom':>10}")
+        print("  " + "-" * 58)
+        for ch in sorted(hits, key=lambda c: -len(hits[c])):
+            recs = hits[ch]
+            dl, site = channel_label(ch)
+            print(f"  {ch/1e6:<10.4f} {dl:<10} {site:<6} "
+                  f"{len(recs):>5} {max(r[1] for r in recs):>8.1f} "
+                  f"{max(r[2] for r in recs):>10.1f}")
+        print(f"\n  Busiest: {sorted(hits, key=lambda c: -len(hits[c]))[0]/1e6:.4f} MHz")
+        if csv_path:
+            print(f"  CSV: {csv_path}")
+
+    return hits
+
+
+def cmd_channel(dwell, rounds, csv_path):
+    """
+    Narrowband per-channel measurement. For each channel, capture a short
+    IQ slice with hackrf_transfer and FFT it. Gives a real SNR per channel
+    and catches short bursts that a sweep steps over.
+    """
+    need()
+    if np is None:
+        sys.exit("channel mode needs numpy: pip install numpy")
+    rate = 2_000_000          # 2 MSPS
+    nsamp = int(rate * dwell)
+    if nsamp > 20_000_000:
+        nsamp = 20_000_000
+    print("=" * 74)
+    print("  Volusia P25 Uplink Finder - CHANNEL mode (narrowband, real SNR)")
+    print(f"  {len(CHANNELS_HZ)} channels x {dwell}s dwell x {rounds} rounds "
+          f"@ {rate/1e6:.0f} MSPS")
+    print(f"  LNA {LNA} VGA {VGA} AMP {AMP}  (~{len(CHANNELS_HZ)*dwell*rounds:.0f}s total)")
+    print("=" * 74)
+
+    fh = None
+    writer = None
+    if csv_path:
+        fh = open(csv_path, "w", newline="")
+        writer = csv.writer(fh)
+        writer.writerow(["utc", "ul_mhz", "dl_mhz", "site", "snr_db", "peak_db"])
+
+    stats = defaultdict(lambda: {"snr": [], "rounds": 0, "active": 0})
+    tmp = tempfile.mktemp(suffix=".iq")
+
+    try:
+        for r in range(rounds):
+            print(f"\n  -- round {r+1}/{rounds} --")
+            for ch in CHANNELS_HZ:
+                cmd = sudo_prefix() + [
+                    "hackrf_transfer",
+                    "-d", SERIAL,
+                    "-r", tmp,
+                    "-f", str(ch),
+                    "-s", str(rate),
+                    "-n", str(nsamp),
+                    "-a", str(AMP),
+                    "-l", str(LNA),
+                    "-g", str(VGA),
+                ]
+                subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                if not os.path.exists(tmp) or os.path.getsize(tmp) < 1024:
+                    continue
+                iq = np.fromfile(tmp, dtype=np.int8)
+                os.unlink(tmp)
+                iq = iq[:(len(iq) // 2) * 2]
+                c = iq[0::2].astype(np.float32) + 1j * iq[1::2].astype(np.float32)
+                if len(c) < 4096:
+                    continue
+                # Welch-ish: average 4096-point PSDs
+                nfft = 4096
+                segs = len(c) // nfft
+                psd = np.zeros(nfft, dtype=np.float64)
+                win = np.hanning(nfft)
+                for k in range(segs):
+                    seg = c[k * nfft:(k + 1) * nfft] * win
+                    psd += np.abs(np.fft.fftshift(np.fft.fft(seg))) ** 2
+                psd /= max(segs, 1)
+                psd_db = 10 * np.log10(psd + 1e-12)
+                floor = np.median(psd_db)
+                peak = float(np.max(psd_db))
+                snr = peak - floor
+                stats[ch]["snr"].append(snr)
+                stats[ch]["rounds"] += 1
+                if snr >= 8.0:
+                    stats[ch]["active"] += 1
+                    dl, site = channel_label(ch)
+                    print(f"   {ch/1e6:>10.4f} MHz  SNR {snr:5.1f} dB   "
+                          f"{dl} {site}   ** ACTIVE **")
+                    if writer:
+                        writer.writerow([datetime.now().isoformat(),
+                                         f"{ch/1e6:.4f}", dl, site,
+                                         f"{snr:.1f}", f"{peak:.1f}"])
+                elif snr >= 5.0:
+                    pass  # marginal, counted but not printed
+    except KeyboardInterrupt:
+        print("\n  stopped by user")
+    finally:
+        if fh:
+            fh.close()
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+    print("\n" + "=" * 74)
+    print("  CHANNEL RANKING (by median SNR)")
+    print("=" * 74)
+    print(f"  {'UL MHz':<10} {'DL MHz':<10} {'site':<6} {'med SNR':>8} "
+          f"{'max SNR':>8} {'active':>7}")
+    print("  " + "-" * 56)
+    ranked = sorted(stats.items(), key=lambda kv: -statistics.median(kv[1]["snr"])
+                    if kv[1]["snr"] else 0)
+    for ch, s in ranked:
+        if not s["snr"]:
+            continue
+        dl, site = channel_label(ch)
+        print(f"  {ch/1e6:<10.4f} {dl:<10} {site:<6} "
+              f"{statistics.median(s['snr']):>8.1f} {max(s['snr']):>8.1f} "
+              f"{s['active']:>4}/{s['rounds']}")
+    print("\n  Channels with median SNR < ~3 dB and 0 active rounds are quiet.")
+    print("  Anything with repeated ACTIVE rounds is a real transmitter.")
+    if csv_path:
+        print(f"  CSV: {csv_path}")
+
+
+def main():
+    global LNA, VGA, AMP, SERIAL
+
+    ap = argparse.ArgumentParser(
+        description="Volusia FL P25 uplink transmitter finder (HackRF)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  %(prog)s calib                       # check gain/overload first
+  %(prog)s sweep --seconds 300        # 5 min wideband, find hot channels
+  %(prog)s sweep --csv hot.csv        # log detections
+  %(prog)s channel --dwell 2 --rounds 5   # confirm + rank channels
+""")
+    sub = ap.add_subparsers(dest="mode")
+
+    p_cal = sub.add_parser("calib", help="measure noise floor / overload")
+
+    p_sw = sub.add_parser("sweep", help="wideband peak scan (default)")
+    p_sw.add_argument("--seconds", type=int, default=0,
+                      help="0 = run until Ctrl-C (default: 0)")
+    p_sw.add_argument("--csv", help="write detections to CSV")
+    p_sw.add_argument("-v", "--verbose", action="store_true")
+
+    p_ch = sub.add_parser("channel", help="narrowband per-channel SNR")
+    p_ch.add_argument("--dwell", type=float, default=2.0,
+                      help="seconds per channel (default 2)")
+    p_ch.add_argument("--rounds", type=int, default=5,
+                      help="passes over the channel list (default 5)")
+    p_ch.add_argument("--csv", help="write detections to CSV")
+
+    # global tuning overrides
+    for p in (p_cal, p_sw, p_ch):
+        p.add_argument("--lna", type=int, default=LNA)
+        p.add_argument("--vga", type=int, default=VGA)
+        p.add_argument("--amp", type=int, default=AMP, choices=[0, 1])
+        p.add_argument("--serial", default=SERIAL)
+
+    args = ap.parse_args()
+
+    LNA, VGA, AMP, SERIAL = args.lna, args.vga, args.amp, args.serial
+
+    mode = args.mode or "sweep"
+    if mode == "calib":
+        cmd_calib()
+    elif mode == "channel":
+        cmd_channel(args.dwell, args.rounds, args.csv)
+    else:
+        secs = getattr(args, "seconds", 0)
+        csvp = getattr(args, "csv", None)
+        verb = getattr(args, "verbose", False)
+        cmd_sweep(secs, csvp, verb)
+
+
+if __name__ == "__main__":
+    main()
