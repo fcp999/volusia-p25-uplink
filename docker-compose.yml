@@ -26,7 +26,7 @@ services:
       LNA: ${LNA:-32}
       VGA: ${VGA:-22}
       AMP: ${AMP:-0}
-      BIN_HZ: ${BIN_HZ:-2000}
+      BIN_HZ: ${BIN_HZ:-2445}
       PEAK_HEIGHT_DB: ${PEAK_HEIGHT_DB:-4.0}
       DWELL: ${DWELL:-2}
       ROUNDS: ${ROUNDS:-5}

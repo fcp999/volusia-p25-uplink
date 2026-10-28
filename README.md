@@ -105,7 +105,7 @@ Environment variables, set in `.env` or via compose `environment:`.
 | `LNA` | `32` | IF gain 0–40 dB, 8 dB steps |
 | `VGA` | `22` | Baseband gain 0–62 dB, 2 dB steps |
 | `AMP` | `0` | RF amp. Keep **off** at 800 MHz — downlinks nearby |
-| `BIN_HZ` | `2000` | Sweep bin width |
+| `BIN_HZ` | `2445` | Sweep bin width. hackrf_sweep rejects anything lower. |
 | `PEAK_HEIGHT_DB` | `4.0` | Peak prominence threshold |
 | `DWELL` | `2` | Seconds per channel, `channel` mode |
 | `ROUNDS` | `5` | Passes over channel list, `channel` mode |
