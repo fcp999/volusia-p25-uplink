@@ -163,10 +163,15 @@ def sweep_cmd(one_pass=True):
     return cmd
 
 
-def collect_sweep(one_pass=True):
-    """Run sweep, return dict{bin_center_hz: dbm} merged at max per bin."""
+def collect_sweep(one_pass=True, verbose=False):
+    """Run sweep, return dict{bin_center_hz: dbm} merged at max per bin.
+
+    stderr is captured and surfaced: a silent empty result is almost always a
+    hackrf open/permission failure, and hiding it makes the failure
+    indistinguishable from "no signal", which is the opposite of useful.
+    """
     proc = subprocess.Popen(sweep_cmd(one_pass), stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                            stderr=subprocess.PIPE, text=True, bufsize=1)
     merged = {}
     try:
         for line in proc.stdout:
@@ -190,6 +195,20 @@ def collect_sweep(one_pass=True):
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 proc.kill()
+
+    if not merged:
+        try:
+            err = (proc.stderr.read() or "").strip()
+        except Exception:
+            err = ""
+        if err:
+            print(f"  [hackrf_sweep] {err}")
+        else:
+            print("  [hackrf_sweep] produced no output (exit "
+                  f"{proc.returncode}); check that the device is attached "
+                  "and readable inside this container")
+    elif verbose:
+        print(f"  [hackrf_sweep] {len(merged)} bins")
     return merged
 
 
@@ -311,9 +330,8 @@ def cmd_sweep(seconds, csv_path, verbose):
         while True:
             if seconds > 0 and time.time() - t_start >= seconds:
                 break
-            bins = collect_sweep()
+            bins = collect_sweep(verbose=False)
             if not bins:
-                print("  (no sweep data - HackRF busy or unplugged)")
                 time.sleep(1)
                 continue
             sweeps += 1
