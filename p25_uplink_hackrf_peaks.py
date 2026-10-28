@@ -114,7 +114,9 @@ SERIAL = os.environ.get("HACKRF_SERIAL", "0000000000000000406464c82346594b")
 AMP = 0       # 800 MHz + nearby strong downlinks: leave the amp OFF
 LNA = 32      # 0-40 dB, 8 dB steps
 VGA = 22      # 0-62 dB, 2 dB steps
-BIN_HZ = 2000 # ~2 kHz sweep resolution. Smaller = more bins = slower USB
+BIN_HZ = 2445 # ~2.4 kHz sweep resolution. HARD FLOOR from hackrf_sweep:
+              # "-w must be no less than 2445". Smaller values are rejected,
+              # so do not tune this downward.
 
 # --- Peak detection tuning -------------------------------------------------
 PEAK_RADIUS = 5      # compare each bin to +/- this many bins (5*2k = +/-10 kHz)
@@ -273,8 +275,8 @@ def cmd_calib():
     print("=" * 74)
     print("  HackRF receive calibration - Volusia P25 uplink band (809-816 MHz)")
     print("=" * 74)
+    global AMP
     for amp in (0, 1):
-        global AMP
         AMP = amp
         t0 = time.time()
         bins = collect_sweep()
