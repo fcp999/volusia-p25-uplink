@@ -19,7 +19,16 @@ set -u
 HACKRF_VIDPID="${HACKRF_VIDPID:-1d50:6089}"
 HACKRF_SERIAL="${HACKRF_SERIAL:-0000000000000000406464c82346594b}"
 DETECTOR="${DETECTOR:-/app/p25_uplink_hackrf_peaks.py}"
-MODE="${MODE:-sweep}"
+
+# Mode can arrive two ways:
+#   docker compose run --rm detector calib     -> positional arg (compose "command")
+#   MODE=calib docker compose up -d            -> environment variable
+# Positional arg wins, because that is what the operator typed most recently.
+MODE="${1:-${MODE:-sweep}}"
+case "$MODE" in
+    sweep|channel|calib) ;;
+    *) echo "unknown mode '$MODE' (use sweep|channel|calib)" >&2; exit 2 ;;
+esac
 
 LOG_DIR="${LOG_DIR:-/app/logs}"
 mkdir -p "$LOG_DIR"
@@ -71,13 +80,21 @@ reset_device() {
 # Detector invocation
 # ---------------------------------------------------------------------------
 detector_args() {
-    local common=(--serial "$HACKRF_SERIAL" --lna "$LNA" --vga "$VGA" --amp "$AMP")
+    # Only pass overrides that were actually set, so the detector's own
+    # defaults stay authoritative and the log line reflects reality.
+    local common=()
+    [ -n "${HACKRF_SERIAL:-}" ] && common+=(--serial "$HACKRF_SERIAL")
+    [ -n "${LNA:-}" ] && common+=(--lna "$LNA")
+    [ -n "${VGA:-}" ] && common+=(--vga "$VGA")
+    [ -n "${AMP:-}" ] && common+=(--amp "$AMP")
+
     case "$MODE" in
         calib)
             echo "calib" "${common[@]}"
             ;;
         channel)
-            echo "channel" --dwell "$DWELL" --rounds "$ROUNDS" "${common[@]}" ${CSV:+--csv "$CSV"}
+            echo "channel" --dwell "${DWELL:-2}" --rounds "${ROUNDS:-5}" \
+                 "${common[@]}" ${CSV:+--csv "$CSV"}
             ;;
         sweep|*)
             echo "sweep" "${common[@]}" ${CSV:+--csv "$CSV"}
@@ -86,11 +103,19 @@ detector_args() {
 }
 
 run_once() {
-    # shellcheck disable=SC2046
     local args
     read -r -a args <<< "$(detector_args)"
-    log "running: python3 $DETECTOR ${args[*]}"
-    python3 -u "$DETECTOR" "${args[@]}" 2>&1 | tee -a "$LOG_FILE"
+
+    # hackrf tools are absent from sudo-bearing images and the device node is
+    # root-only (crw-rw-r--), so run the detector as root explicitly when we
+    # have the privilege but are not already uid 0.
+    local runner=(python3 -u "$DETECTOR")
+    if [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1; then
+        runner=(sudo python3 -u "$DETECTOR")
+    fi
+
+    log "running: ${runner[*]} ${args[*]}"
+    "${runner[@]}" "${args[@]}" 2>&1 | tee -a "$LOG_FILE"
     return "${PIPESTATUS[0]}"
 }
 
