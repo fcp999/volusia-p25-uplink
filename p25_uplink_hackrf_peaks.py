@@ -574,20 +574,30 @@ def cmd_channel(dwell, rounds, csv_path, dump=False):
         print(f"  CSV: {csv_path}")
 
 
-def cmd_spectrum(ch, seconds):
+def cmd_spectrum(freq_hz, seconds):
     """
-    Diagnostic: dump the full spectrum around one channel as ASCII bars.
-    DC spike is marked so it can never again be mistaken for a signal.
+    Diagnostic: dump the spectrum around one frequency as ASCII bars.
+
+    The LO is deliberately offset from the frequency of interest. Tuning
+    straight onto it puts HackRF's DC artefact exactly where the signal
+    should be, and that artefact reads ~55 dB above floor - indistinguishable
+    from a strong carrier. Measured on live hardware: naming 856.9375 as the
+    tune frequency produced an 80.5 dB peak at 856.9375 and flat 26 dB noise
+    either side, which is the receiver, not a tower.
+
+    So: tune OFFSET_HZ away, label the spike where it actually lands, and
+    report a verdict on the requested frequency specifically.
     """
     need()
     if np is None:
         sys.exit("spectrum needs numpy: pip install numpy")
     rate = 2_000_000
     nsamp = int(rate * seconds)
-    lo = int(ch)
+    lo = int(freq_hz + OFFSET_HZ)
     tmp = tempfile.mktemp(suffix=".iq")
-    print(f"  capturing {seconds:.1f}s at LO {lo/1e6:.4f} MHz "
-          f"(LNA {LNA} VGA {VGA} AMP {AMP})")
+    print(f"  target {freq_hz/1e6:.4f} MHz, LO {lo/1e6:.4f} MHz "
+          f"({OFFSET_HZ/1000:+.0f} kHz offset)")
+    print(f"  capturing {seconds:.1f}s (LNA {LNA} VGA {VGA} AMP {AMP})")
     subprocess.run(sudo_prefix() + [
         "hackrf_transfer", "-d", SERIAL, "-r", tmp, "-f", str(lo),
         "-s", str(rate), "-n", str(nsamp), "-a", str(AMP),
@@ -608,18 +618,35 @@ def cmd_spectrum(ch, seconds):
         psd += np.abs(np.fft.fftshift(np.fft.fft(seg))) ** 2
     psd_db = 10 * np.log10(psd / segs + 1e-12)
     freqs = np.linspace(lo - rate / 2, lo + rate / 2, nfft, endpoint=False)
-    floor = float(np.median(psd_db))
-    print(f"  floor {floor:.1f} dB   peak {psd_db.max():.1f} dB "
-          f"@ {freqs[int(np.argmax(psd_db))]/1e6:.4f} MHz")
-    print(f"  {'freq MHz':<12} {'dB':>6}")
+
+    # Exclude the DC region from every measurement, including the floor.
+    offs = freqs - lo
+    dc_mask = np.abs(offs) <= DC_EXCLUDE_HZ
+    floor = float(np.median(psd_db[~dc_mask]))
+
+    # Verdict on the requested frequency only.
+    sig_mask = np.abs(freqs - freq_hz) <= SIG_WINDOW_HZ
+    verdict_pk = float(psd_db[sig_mask].max()) if sig_mask.any() else float("nan")
+    verdict_snr = verdict_pk - floor
+
+    print(f"  floor {floor:.1f} dB (DC region excluded)")
+    print(f"  at {freq_hz/1e6:.4f} MHz: peak {verdict_pk:.1f} dB  "
+          f"= {verdict_snr:+.1f} dB above floor")
+    if verdict_snr >= ACTIVE_SNR_DB:
+        print(f"  >>> SIGNAL PRESENT (>= {ACTIVE_SNR_DB:.0f} dB) - carrier at this frequency")
+    else:
+        print(f"  >>> no carrier detected (threshold {ACTIVE_SNR_DB:.0f} dB)")
+
+    print(f"\n  {'freq MHz':<12} {'dB':>6}")
     step = max(1, nfft // 96)
-    # The DC artefact is a few kHz wide, but the *exclusion* zone is
-    # deliberately wide so skirts never leak into measurements. Label only
-    # the genuinely narrow core, or the display overstates the spike 10x.
     label_core = rate / nfft * 3      # ~3 bins either side of the LO
     for i in range(0, nfft, step):
-        off = freqs[i] - lo
-        tag = " [DC SPIKE - artefact]" if abs(off) <= label_core else ""
+        off = offs[i]
+        tag = ""
+        if abs(off) <= label_core:
+            tag = " [DC SPIKE - artefact, ignored]"
+        elif sig_mask[i]:
+            tag = " <== target"
         print(f"  {freqs[i]/1e6:10.4f} {psd_db[i]:6.1f} "
               f"{'#' * int(max(0.0, psd_db[i] - floor))}{tag}")
 
