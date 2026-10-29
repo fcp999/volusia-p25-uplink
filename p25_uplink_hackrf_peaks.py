@@ -109,6 +109,17 @@ CHANNELS_HZ = sorted(int(round(f * 1e6)) for f in UPLINK_CHANNELS)
 FREQ_LOW_MHZ = 809
 FREQ_HIGH_MHZ = 816
 
+# P25 800 MHz downlink side is +45 MHz from the uplink plan. Towers transmit
+# here continuously (control channel especially), so it is far easier to
+# confirm the system is alive than by watching sparse uplink bursts.
+DOWNLINK_LOW_MHZ = 854
+DOWNLINK_HIGH_MHZ = 861
+
+# Selected band for the current run. `uplink` is the original purpose;
+# `downlink` is for proving the system is on the air at all.
+BAND_LOW_MHZ = FREQ_LOW_MHZ
+BAND_HIGH_MHZ = FREQ_HIGH_MHZ
+
 # --- HackRF settings -------------------------------------------------------
 SERIAL = os.environ.get("HACKRF_SERIAL", "0000000000000000406464c82346594b")
 AMP = 0       # 800 MHz + nearby strong downlinks: leave the amp OFF
@@ -168,7 +179,7 @@ def sweep_cmd(one_pass=True):
         "-l", str(LNA),
         "-g", str(VGA),
         "-w", str(BIN_HZ),
-        "-f", f"{FREQ_LOW_MHZ}:{FREQ_HIGH_MHZ}",
+        "-f", f"{BAND_LOW_MHZ}:{BAND_HIGH_MHZ}",
     ]
     if one_pass:
         cmd.append("-1")
@@ -314,7 +325,7 @@ def cmd_sweep(seconds, csv_path, verbose):
     need()
     print("=" * 74)
     print("  Volusia P25 Uplink Finder - SWEEP mode (peak detection)")
-    print(f"  Band {FREQ_LOW_MHZ}-{FREQ_HIGH_MHZ} MHz | bin {BIN_HZ} Hz | "
+    print(f"  Band {BAND_LOW_MHZ}-{BAND_HIGH_MHZ} MHz | bin {BIN_HZ} Hz | "
           f"LNA {LNA} VGA {VGA} AMP {AMP}")
     print(f"  Peak rule: >= {PEAK_HEIGHT_DB} dB above local median, "
           f"width >= {MIN_RUN_BINS} bins, within {CHANNEL_TOL_HZ//1000} kHz of a channel")
@@ -322,6 +333,7 @@ def cmd_sweep(seconds, csv_path, verbose):
     print("=" * 74)
 
     writer = None
+    fh = None
     if csv_path:
         fh = open(csv_path, "w", newline="")
         writer = csv.writer(fh)
@@ -348,7 +360,7 @@ def cmd_sweep(seconds, csv_path, verbose):
                 continue
             sweeps += 1
             now = datetime.now()
-            lo, hi = FREQ_LOW_MHZ * 1e6, FREQ_HIGH_MHZ * 1e6
+            lo, hi = BAND_LOW_MHZ * 1e6, BAND_HIGH_MHZ * 1e6
 
             ordered = sorted((f, d) for f, d in bins.items() if lo <= f <= hi)
             peaks = find_peaks(ordered)
@@ -379,7 +391,7 @@ def cmd_sweep(seconds, csv_path, verbose):
     except KeyboardInterrupt:
         print("\n  stopped by user")
     finally:
-        if csv_path:
+        if fh:
             fh.close()
 
     dt = time.time() - t_start
@@ -613,7 +625,7 @@ def cmd_spectrum(ch, seconds):
 
 
 def main():
-    global LNA, VGA, AMP, SERIAL
+    global LNA, VGA, AMP, SERIAL, BAND_LOW_MHZ, BAND_HIGH_MHZ
 
     ap = argparse.ArgumentParser(
         description="Volusia FL P25 uplink transmitter finder (HackRF)",
@@ -622,10 +634,12 @@ def main():
 examples:
   %(prog)s calib                       # check gain/overload first
   %(prog)s sweep --seconds 300        # 5 min wideband, find hot channels
+  %(prog)s sweep --band downlink       # listen to the towers instead
   %(prog)s sweep --csv hot.csv        # log detections
   %(prog)s channel --dwell 2 --rounds 5   # confirm + rank channels
   %(prog)s channel --dump --rounds 1      # see the spectrum per channel
   %(prog)s spectrum 811.4625              # inspect one frequency
+  %(prog)s spectrum 856.9375 --band downlink   # is the control channel up?
 """)
     sub = ap.add_subparsers(dest="mode")
 
@@ -659,10 +673,17 @@ examples:
         p.add_argument("--vga", type=int, default=VGA)
         p.add_argument("--amp", type=int, default=AMP, choices=[0, 1])
         p.add_argument("--serial", default=SERIAL)
+        p.add_argument("--band", choices=["uplink", "downlink"], default="uplink",
+                       help="800 MHz side to scan: uplink (809-816, radios) or "
+                            "downlink (854-861, towers). Default: uplink")
 
     args = ap.parse_args()
 
     LNA, VGA, AMP, SERIAL = args.lna, args.vga, args.amp, args.serial
+    if args.band == "downlink":
+        BAND_LOW_MHZ, BAND_HIGH_MHZ = DOWNLINK_LOW_MHZ, DOWNLINK_HIGH_MHZ
+    else:
+        BAND_LOW_MHZ, BAND_HIGH_MHZ = FREQ_LOW_MHZ, FREQ_HIGH_MHZ
 
     mode = args.mode or "sweep"
     if mode == "calib":
