@@ -26,16 +26,16 @@ DETECTOR="${DETECTOR:-/app/p25_uplink_hackrf_peaks.py}"
 # Positional arg wins, because that is what the operator typed most recently.
 MODE="${1:-${MODE:-sweep}}"
 case "$MODE" in
-    sweep|calib) ;;
-    channel|spectrum)
-        # These take their own arguments after the mode name; shift it off so
-        # `detector spectrum 105.1 --seconds 2` passes the rest through.
-        shift 2>/dev/null || true
+    sweep|channel|calib|spectrum)
+        # The mode word is consumed here and re-emitted by detector_args(), so
+        # drop it from the passthrough list or it gets appended twice
+        # (observed: 'sweep ... sweep --band downlink').
+        if [ $# -gt 0 ]; then shift; fi
         ;;
     *) echo "unknown mode '$MODE' (use sweep|channel|calib|spectrum)" >&2; exit 2 ;;
 esac
 
-# Free-form arguments after the mode (e.g. "spectrum 105.1 --seconds 2")
+# Remaining arguments for the detector (e.g. --band downlink, --seconds 60)
 EXTRA_ARGS=("$@")
 
 LOG_DIR="${LOG_DIR:-/app/logs}"
