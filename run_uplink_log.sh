@@ -138,9 +138,16 @@ log "mode=$MODE lna=${LNA:-32} vga=${VGA:-22} amp=${AMP:-0} serial=$HACKRF_SERIA
 
 if ! lsusb -d "$HACKRF_VIDPID" >/dev/null 2>&1; then
     log "WARNING: HackRF ($HACKRF_VIDPID) not visible on /dev/bus/usb."
-    log "  Host fix: on VMware/Proxmox, attach the HackRF to the guest;"
-    log "  then confirm with: lsusb -d $HACKRF_VIDPID on the host AND guest."
-    log "  On Windows/macOS Docker Desktop this cannot work - see README."
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+        log "  This is WSL. Re-attach on the Windows side, then retry:"
+        log "    usbipd attach --wsl --busid <id>"
+        log "    (usbipd list shows the busid; state must read 'Attached')"
+        log "  Attach does NOT survive reboot, re-plug, or 'wsl --shutdown'."
+    else
+        log "  Linux host: confirm the device is on the bus: lsusb -d $HACKRF_VIDPID"
+        log "  VMware/Proxmox guest: attach the HackRF in the VM's USB devices."
+        log "  Docker Desktop on Windows/macOS: raw USB cannot work - see README."
+    fi
 fi
 
 backoff=5
@@ -162,10 +169,12 @@ while true; do
     run_once
     rc=$?
 
-    # One-shot modes: a real run that completed is not a fault.
-    if [ "$MODE" = "calib" ] || [ "$MODE" = "channel" ]; then
+    # One-shot modes: a run that completed is a result, not a fault. These
+    # must exit, or the wrapper re-runs them forever (observed: three
+    # identical captures from a single spectrum invocation).
+    if [ "$MODE" = "calib" ] || [ "$MODE" = "channel" ] || [ "$MODE" = "spectrum" ]; then
         if device_present; then
-            log "$MODE finished cleanly (rc=$rc)"
+            log "$MODE finished (rc=$rc)"
             exit "$rc"
         fi
         log "$MODE exited rc=$rc and the device is gone - recovering"

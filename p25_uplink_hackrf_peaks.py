@@ -601,9 +601,13 @@ def cmd_spectrum(ch, seconds):
           f"@ {freqs[int(np.argmax(psd_db))]/1e6:.4f} MHz")
     print(f"  {'freq MHz':<12} {'dB':>6}")
     step = max(1, nfft // 96)
+    # The DC artefact is a few kHz wide, but the *exclusion* zone is
+    # deliberately wide so skirts never leak into measurements. Label only
+    # the genuinely narrow core, or the display overstates the spike 10x.
+    label_core = rate / nfft * 3      # ~3 bins either side of the LO
     for i in range(0, nfft, step):
         off = freqs[i] - lo
-        tag = " [DC SPIKE - artefact]" if abs(off) <= DC_EXCLUDE_HZ else ""
+        tag = " [DC SPIKE - artefact]" if abs(off) <= label_core else ""
         print(f"  {freqs[i]/1e6:10.4f} {psd_db[i]:6.1f} "
               f"{'#' * int(max(0.0, psd_db[i] - floor))}{tag}")
 
