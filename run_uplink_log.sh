@@ -26,9 +26,17 @@ DETECTOR="${DETECTOR:-/app/p25_uplink_hackrf_peaks.py}"
 # Positional arg wins, because that is what the operator typed most recently.
 MODE="${1:-${MODE:-sweep}}"
 case "$MODE" in
-    sweep|channel|calib) ;;
-    *) echo "unknown mode '$MODE' (use sweep|channel|calib)" >&2; exit 2 ;;
+    sweep|calib) ;;
+    channel|spectrum)
+        # These take their own arguments after the mode name; shift it off so
+        # `detector spectrum 105.1 --seconds 2` passes the rest through.
+        shift 2>/dev/null || true
+        ;;
+    *) echo "unknown mode '$MODE' (use sweep|channel|calib|spectrum)" >&2; exit 2 ;;
 esac
+
+# Free-form arguments after the mode (e.g. "spectrum 105.1 --seconds 2")
+EXTRA_ARGS=("$@")
 
 LOG_DIR="${LOG_DIR:-/app/logs}"
 mkdir -p "$LOG_DIR"
@@ -94,10 +102,13 @@ detector_args() {
             ;;
         channel)
             echo "channel" --dwell "${DWELL:-2}" --rounds "${ROUNDS:-5}" \
-                 "${common[@]}" ${CSV:+--csv "$CSV"}
+                 "${common[@]}" ${CSV:+--csv "$CSV"} "${EXTRA_ARGS[@]}"
+            ;;
+        spectrum)
+            echo "spectrum" "${EXTRA_ARGS[@]}" "${common[@]}"
             ;;
         sweep|*)
-            echo "sweep" "${common[@]}" ${CSV:+--csv "$CSV"}
+            echo "sweep" "${common[@]}" ${CSV:+--csv "$CSV"} "${EXTRA_ARGS[@]}"
             ;;
     esac
 }
