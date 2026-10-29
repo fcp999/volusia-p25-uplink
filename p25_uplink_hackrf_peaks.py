@@ -126,6 +126,16 @@ CHANNEL_TOL_HZ = 8000    # a peak this close to a known channel = ON that channe
 COOLDOWN_SEC = 2.0   # do not re-print the same channel faster than this
 CHANNEL_EDGE_HZ = 10000  # ignore peaks right at the edges of a sweep segment
 
+# --- Channel mode (hackrf_transfer + FFT) -----------------------------------
+# HackRF produces a large DC offset at the tune frequency. Tuning exactly onto
+# a channel puts that artefact on top of the signal and reports ~55 dB SNR on
+# empty channels. Measured on a live unit: a 59 dB spike at the LO with flat
+# noise either side. So we detune and exclude the DC region explicitly.
+OFFSET_HZ = 400_000      # tune this far off the channel
+DC_EXCLUDE_HZ = 60_000   # ignore this much around the LO (spike + skirts)
+SIG_WINDOW_HZ = 25_000   # search window around the expected signal position
+ACTIVE_SNR_DB = 8.0      # peak-to-floor within the signal window to count
+
 
 def need(root_msg="hackrf tools"):
     if shutil.which("hackrf_sweep") is None:
@@ -397,11 +407,19 @@ def cmd_sweep(seconds, csv_path, verbose):
     return hits
 
 
-def cmd_channel(dwell, rounds, csv_path):
+def cmd_channel(dwell, rounds, csv_path, dump=False):
     """
-    Narrowband per-channel measurement. For each channel, capture a short
-    IQ slice with hackrf_transfer and FFT it. Gives a real SNR per channel
-    and catches short bursts that a sweep steps over.
+    Narrowband per-channel measurement.
+
+    CRITICAL: HackRF has a large DC offset at the tune frequency. Tuning
+    exactly onto a channel puts that artefact on top of the signal, and a
+    naive peak-to-median measurement then reports 50-60 dB SNR on every
+    channel including empty ones. That is not signal, it is the receiver.
+
+    So we tune OFFSET_HZ away from the channel and look for the signal in a
+    window centred on where it should appear, explicitly excluding the DC
+    region around the LO. The noise floor is estimated from the same slice,
+    away from both the DC spike and the signal window.
     """
     need()
     if np is None:
@@ -411,9 +429,11 @@ def cmd_channel(dwell, rounds, csv_path):
     if nsamp > 20_000_000:
         nsamp = 20_000_000
     print("=" * 74)
-    print("  Volusia P25 Uplink Finder - CHANNEL mode (narrowband, real SNR)")
+    print("  Volusia P25 Uplink Finder - CHANNEL mode (DC-offset aware)")
     print(f"  {len(CHANNELS_HZ)} channels x {dwell}s dwell x {rounds} rounds "
           f"@ {rate/1e6:.0f} MSPS")
+    print(f"  Tune offset {OFFSET_HZ/1000:+.0f} kHz; DC region "
+          f"+/-{DC_EXCLUDE_HZ/1000:.0f} kHz excluded")
     print(f"  LNA {LNA} VGA {VGA} AMP {AMP}  (~{len(CHANNELS_HZ)*dwell*rounds:.0f}s total)")
     print("=" * 74)
 
@@ -422,7 +442,8 @@ def cmd_channel(dwell, rounds, csv_path):
     if csv_path:
         fh = open(csv_path, "w", newline="")
         writer = csv.writer(fh)
-        writer.writerow(["utc", "ul_mhz", "dl_mhz", "site", "snr_db", "peak_db"])
+        writer.writerow(["utc", "ul_mhz", "dl_mhz", "site", "snr_db",
+                         "peak_db", "peak_offset_hz"])
 
     stats = defaultdict(lambda: {"snr": [], "rounds": 0, "active": 0})
     tmp = tempfile.mktemp(suffix=".iq")
@@ -431,11 +452,13 @@ def cmd_channel(dwell, rounds, csv_path):
         for r in range(rounds):
             print(f"\n  -- round {r+1}/{rounds} --")
             for ch in CHANNELS_HZ:
+                # Tune away from the channel so the DC spike lands elsewhere.
+                lo = ch + OFFSET_HZ
                 cmd = sudo_prefix() + [
                     "hackrf_transfer",
                     "-d", SERIAL,
                     "-r", tmp,
-                    "-f", str(ch),
+                    "-f", str(lo),
                     "-s", str(rate),
                     "-n", str(nsamp),
                     "-a", str(AMP),
@@ -452,7 +475,7 @@ def cmd_channel(dwell, rounds, csv_path):
                 c = iq[0::2].astype(np.float32) + 1j * iq[1::2].astype(np.float32)
                 if len(c) < 4096:
                     continue
-                # Welch-ish: average 4096-point PSDs
+
                 nfft = 4096
                 segs = len(c) // nfft
                 psd = np.zeros(nfft, dtype=np.float64)
@@ -462,22 +485,52 @@ def cmd_channel(dwell, rounds, csv_path):
                     psd += np.abs(np.fft.fftshift(np.fft.fft(seg))) ** 2
                 psd /= max(segs, 1)
                 psd_db = 10 * np.log10(psd + 1e-12)
-                floor = np.median(psd_db)
-                peak = float(np.max(psd_db))
+
+                # Bin frequency axis: centre is the LO, i.e. `lo`.
+                freqs = np.linspace(lo - rate / 2, lo + rate / 2, nfft,
+                                    endpoint=False)
+                offs = freqs - lo                      # offset from the LO
+                dc_mask = np.abs(offs) <= DC_EXCLUDE_HZ
+
+                # Where the channel of interest should appear.
+                sig_centre = ch - lo
+                sig_mask = np.abs(offs - sig_centre) <= SIG_WINDOW_HZ
+                floor_mask = (~dc_mask) & (~sig_mask)
+                if not sig_mask.any() or floor_mask.sum() < 16:
+                    continue
+
+                floor = float(np.median(psd_db[floor_mask]))
+                sig_idx = np.where(sig_mask)[0]
+                pk = int(sig_idx[int(np.argmax(psd_db[sig_mask]))])
+                peak = float(psd_db[pk])
+                peak_off = float(offs[pk]) - sig_centre
                 snr = peak - floor
+
                 stats[ch]["snr"].append(snr)
                 stats[ch]["rounds"] += 1
-                if snr >= 8.0:
+
+                if dump:
+                    dl, site = channel_label(ch)
+                    print(f"\n   --- {ch/1e6:.4f} MHz  {dl} {site}  "
+                          f"(LO {lo/1e6:.4f}, floor {floor:.1f} dB) ---")
+                    step = max(1, nfft // 48)
+                    for i in range(0, nfft, step):
+                        bar = "#" * int(max(0.0, (psd_db[i] - floor) * 1.5))
+                        mark = (" <== SIGNAL" if sig_mask[i] else
+                                "  [DC]" if dc_mask[i] else "")
+                        print(f"    {freqs[i]/1e6:10.4f} {psd_db[i]:6.1f} {bar}{mark}")
+
+                if snr >= ACTIVE_SNR_DB:
                     stats[ch]["active"] += 1
                     dl, site = channel_label(ch)
-                    print(f"   {ch/1e6:>10.4f} MHz  SNR {snr:5.1f} dB   "
+                    print(f"   {ch/1e6:>10.4f} MHz  SNR {snr:5.1f} dB  "
+                          f"({peak_off/1000:+5.1f} kHz)  "
                           f"{dl} {site}   ** ACTIVE **")
                     if writer:
                         writer.writerow([datetime.now().isoformat(),
                                          f"{ch/1e6:.4f}", dl, site,
-                                         f"{snr:.1f}", f"{peak:.1f}"])
-                elif snr >= 5.0:
-                    pass  # marginal, counted but not printed
+                                         f"{snr:.1f}", f"{peak:.1f}",
+                                         f"{peak_off:.0f}"])
     except KeyboardInterrupt:
         print("\n  stopped by user")
     finally:
@@ -487,7 +540,7 @@ def cmd_channel(dwell, rounds, csv_path):
             os.unlink(tmp)
 
     print("\n" + "=" * 74)
-    print("  CHANNEL RANKING (by median SNR)")
+    print("  CHANNEL RANKING (by median SNR, DC spike excluded)")
     print("=" * 74)
     print(f"  {'UL MHz':<10} {'DL MHz':<10} {'site':<6} {'med SNR':>8} "
           f"{'max SNR':>8} {'active':>7}")
@@ -501,10 +554,58 @@ def cmd_channel(dwell, rounds, csv_path):
         print(f"  {ch/1e6:<10.4f} {dl:<10} {site:<6} "
               f"{statistics.median(s['snr']):>8.1f} {max(s['snr']):>8.1f} "
               f"{s['active']:>4}/{s['rounds']}")
-    print("\n  Channels with median SNR < ~3 dB and 0 active rounds are quiet.")
-    print("  Anything with repeated ACTIVE rounds is a real transmitter.")
+    print(f"\n  A channel is real when SNR > {ACTIVE_SNR_DB:.0f} dB with a peak "
+          "inside the signal window and steady across rounds.")
+    print("  If EVERY channel still reads high, the front end is overloaded:")
+    print("  lower VGA (e.g. VGA=10 LNA=16) and re-run.")
     if csv_path:
         print(f"  CSV: {csv_path}")
+
+
+def cmd_spectrum(ch, seconds):
+    """
+    Diagnostic: dump the full spectrum around one channel as ASCII bars.
+    DC spike is marked so it can never again be mistaken for a signal.
+    """
+    need()
+    if np is None:
+        sys.exit("spectrum needs numpy: pip install numpy")
+    rate = 2_000_000
+    nsamp = int(rate * seconds)
+    lo = int(ch)
+    tmp = tempfile.mktemp(suffix=".iq")
+    print(f"  capturing {seconds:.1f}s at LO {lo/1e6:.4f} MHz "
+          f"(LNA {LNA} VGA {VGA} AMP {AMP})")
+    subprocess.run(sudo_prefix() + [
+        "hackrf_transfer", "-d", SERIAL, "-r", tmp, "-f", str(lo),
+        "-s", str(rate), "-n", str(nsamp), "-a", str(AMP),
+        "-l", str(LNA), "-g", str(VGA),
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not os.path.exists(tmp):
+        sys.exit("  capture failed - check device")
+    iq = np.fromfile(tmp, dtype=np.int8)
+    os.unlink(tmp)
+    iq = iq[:(len(iq) // 2) * 2]
+    c = iq[0::2].astype(np.float32) + 1j * iq[1::2].astype(np.float32)
+    nfft = 4096
+    segs = max(1, len(c) // nfft)
+    win = np.hanning(nfft)
+    psd = np.zeros(nfft, dtype=np.float64)
+    for k in range(segs):
+        seg = c[k * nfft:(k + 1) * nfft] * win
+        psd += np.abs(np.fft.fftshift(np.fft.fft(seg))) ** 2
+    psd_db = 10 * np.log10(psd / segs + 1e-12)
+    freqs = np.linspace(lo - rate / 2, lo + rate / 2, nfft, endpoint=False)
+    floor = float(np.median(psd_db))
+    print(f"  floor {floor:.1f} dB   peak {psd_db.max():.1f} dB "
+          f"@ {freqs[int(np.argmax(psd_db))]/1e6:.4f} MHz")
+    print(f"  {'freq MHz':<12} {'dB':>6}")
+    step = max(1, nfft // 96)
+    for i in range(0, nfft, step):
+        off = freqs[i] - lo
+        tag = " [DC SPIKE - artefact]" if abs(off) <= DC_EXCLUDE_HZ else ""
+        print(f"  {freqs[i]/1e6:10.4f} {psd_db[i]:6.1f} "
+              f"{'#' * int(max(0.0, psd_db[i] - floor))}{tag}")
 
 
 def main():
@@ -519,6 +620,8 @@ examples:
   %(prog)s sweep --seconds 300        # 5 min wideband, find hot channels
   %(prog)s sweep --csv hot.csv        # log detections
   %(prog)s channel --dwell 2 --rounds 5   # confirm + rank channels
+  %(prog)s channel --dump --rounds 1      # see the spectrum per channel
+  %(prog)s spectrum 811.4625              # inspect one frequency
 """)
     sub = ap.add_subparsers(dest="mode")
 
@@ -530,15 +633,24 @@ examples:
     p_sw.add_argument("--csv", help="write detections to CSV")
     p_sw.add_argument("-v", "--verbose", action="store_true")
 
-    p_ch = sub.add_parser("channel", help="narrowband per-channel SNR")
+    p_ch = sub.add_parser("channel", help="narrowband per-channel SNR (DC-aware)")
     p_ch.add_argument("--dwell", type=float, default=2.0,
                       help="seconds per channel (default 2)")
     p_ch.add_argument("--rounds", type=int, default=5,
                       help="passes over the channel list (default 5)")
     p_ch.add_argument("--csv", help="write detections to CSV")
+    p_ch.add_argument("--dump", action="store_true",
+                      help="print the spectrum for each channel")
+
+    p_sp = sub.add_parser("spectrum",
+                          help="dump the spectrum at one frequency (diagnostic)")
+    p_sp.add_argument("freq_mhz", type=float,
+                      help="tune frequency in MHz, e.g. 811.4625")
+    p_sp.add_argument("--seconds", type=float, default=1.0,
+                      help="capture length (default 1.0)")
 
     # global tuning overrides
-    for p in (p_cal, p_sw, p_ch):
+    for p in (p_cal, p_sw, p_ch, p_sp):
         p.add_argument("--lna", type=int, default=LNA)
         p.add_argument("--vga", type=int, default=VGA)
         p.add_argument("--amp", type=int, default=AMP, choices=[0, 1])
@@ -552,7 +664,10 @@ examples:
     if mode == "calib":
         cmd_calib()
     elif mode == "channel":
-        cmd_channel(args.dwell, args.rounds, args.csv)
+        cmd_channel(args.dwell, args.rounds, args.csv,
+                    dump=getattr(args, "dump", False))
+    elif mode == "spectrum":
+        cmd_spectrum(int(round(args.freq_mhz * 1e6)), args.seconds)
     else:
         secs = getattr(args, "seconds", 0)
         csvp = getattr(args, "csv", None)
